@@ -925,6 +925,30 @@ void forward_yolo_layer(const layer l, network_state state)
         //    (l.iou_loss == MSE ? "mse" : (l.iou_loss == GIOU ? "giou" : "iou")), l.iou_normalizer, l.obj_normalizer, state.index, tot_iou / count, tot_giou / count, avg_cat / class_count, avg_obj / count, avg_anyobj / (l.w*l.h*l.n*l.batch), recall / count, recall75 / count, count,
         //    classification_loss, iou_loss, loss);
     }
+
+    // Response-Based KD: add MSE gradient on objectness + class probs (skip box tx,ty,tw,th)
+    // teacher output buffer is pre-computed per subdivision in detector.c BLOCK B
+    if (l.kd_teacher_output && l.kd_weight > 0.0f) {
+        int spatial    = l.w * l.h;
+        int entry_size = 4 + 1 + l.classes;  // tx,ty,tw,th, obj, cls...
+        // offset into flat buffer: subdivision index * batch * outputs
+        float *teacher_out = l.kd_teacher_output +
+                             state.net.current_subdivision * (size_t)l.batch * l.outputs;
+        int a, bb, s, c;
+        for (bb = 0; bb < l.batch; ++bb) {
+            for (a = 0; a < l.n; ++a) {
+                // objectness: entry 4, then class probs: entries 5..4+classes
+                for (c = 4; c < entry_size; ++c) {
+                    int base = bb * l.outputs + a * entry_size * spatial + c * spatial;
+                    for (s = 0; s < spatial; ++s) {
+                        float diff = l.output[base + s] - teacher_out[base + s];
+                        l.delta[base + s] += l.kd_weight * 2.0f * diff;
+                    }
+                }
+            }
+        }
+    }
+    // End KD
 }
 
 void backward_yolo_layer(const layer l, network_state state)

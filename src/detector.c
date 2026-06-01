@@ -86,6 +86,59 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     srand(time(0));
     network net = nets[0];
 
+    // ── KD BLOCK A: load teacher network ─────────────────────────────────────
+    // Add to your .data file:
+    //   teacher_cfg     = mycfg/yolov4-tiny_helmet.cfg
+    //   teacher_weights = mybackup/yolov4-tiny_helmet_final.weights
+    //   kd_weight       = 0.1
+    char *teacher_cfg_file     = option_find_str_quiet(options, "teacher_cfg",     "");
+    char *teacher_weights_file = option_find_str_quiet(options, "teacher_weights", "");
+    float kd_weight_val        = option_find_float_quiet(options, "kd_weight", 0.0f);
+    network *teacher_net = NULL;
+    int kd_n_pairs = 0;
+    int kd_teacher_yolo_idx[8]; memset(kd_teacher_yolo_idx, -1, sizeof(kd_teacher_yolo_idx));
+    int kd_student_yolo_idx[8]; memset(kd_student_yolo_idx, -1, sizeof(kd_student_yolo_idx));
+    float *kd_bufs[8];          memset(kd_bufs, 0, sizeof(kd_bufs));
+    if (strlen(teacher_cfg_file) > 0 && strlen(teacher_weights_file) > 0 && kd_weight_val > 0.0f) {
+        printf("\n[KD] teacher_cfg     = %s\n[KD] teacher_weights = %s\n[KD] kd_weight       = %.3f\n",
+               teacher_cfg_file, teacher_weights_file, kd_weight_val);
+        teacher_net = (network*)xcalloc(1, sizeof(network));
+        *teacher_net = parse_network_cfg_custom(teacher_cfg_file, net.batch, 0);
+        load_weights(teacher_net, teacher_weights_file);
+        printf("[KD] Teacher loaded: %d layers, %dx%dx%d, batch=%d\n",
+               teacher_net->n, teacher_net->w, teacher_net->h, teacher_net->c, teacher_net->batch);
+        // Find teacher YOLO layer indices
+        int t_yolo_idxs[8]; int n_t = 0;
+        for (int _i = 0; _i < teacher_net->n && n_t < 8; ++_i)
+            if (teacher_net->layers[_i].type == YOLO) t_yolo_idxs[n_t++] = _i;
+        // Match student YOLO layers by spatial size
+        for (int _i = 0; _i < net.n && kd_n_pairs < n_t; ++_i) {
+            if (net.layers[_i].type == YOLO) {
+                layer *sl = &net.layers[_i];
+                for (int _t = 0; _t < n_t; ++_t) {
+                    layer *tl = &teacher_net->layers[t_yolo_idxs[_t]];
+                    if (sl->w == tl->w && sl->h == tl->h) {
+                        kd_student_yolo_idx[kd_n_pairs] = _i;
+                        kd_teacher_yolo_idx[kd_n_pairs] = t_yolo_idxs[_t];
+                        // Set kd_weight on all GPU copies of this student YOLO layer
+                        for (int _k = 0; _k < ngpus; ++_k)
+                            nets[_k].layers[_i].kd_weight = kd_weight_val;
+                        ++kd_n_pairs;
+                        break;
+                    }
+                }
+            }
+        }
+        if (kd_n_pairs == 0) {
+            fprintf(stderr, "[KD] WARNING: No YOLO layer spatial size match! KD disabled.\n");
+            free_network(*teacher_net); free(teacher_net); teacher_net = NULL;
+        } else {
+            printf("[KD] Matched %d student/teacher YOLO layer pair(s). KD enabled.\n", kd_n_pairs);
+        }
+    }
+    net = nets[0];
+    // ── End KD BLOCK A ────────────────────────────────────────────────────────
+
     const int actual_batch_size = net.batch * net.subdivisions;
     if (actual_batch_size == 1) {
         error("Error: You set incorrect value batch=1 for Training! You should set batch=64 subdivision=64", DARKNET_LOC);
@@ -282,6 +335,84 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
 
         time = what_time_is_it_now();
         float loss = 0;
+
+        // ── KD BLOCK B: pre-compute teacher outputs for all subdivisions ──────
+        if (teacher_net && kd_n_pairs > 0) {
+            int batch     = net.batch;
+            int n_subdiv  = train.X.rows / batch;
+            int t_spatial = teacher_net->w * teacher_net->h;   // 320*320 for 1:1 input
+            int t_imgsize = t_spatial * teacher_net->c;        // 3-ch for teacher
+
+            // (Re-)allocate flat buffers: [n_subdiv * batch * outputs] per YOLO pair
+            for (int _j = 0; _j < kd_n_pairs; ++_j) {
+                int tl_idx = kd_teacher_yolo_idx[_j];
+                int sl_idx = kd_student_yolo_idx[_j];
+                int buf_n  = n_subdiv * batch * teacher_net->layers[tl_idx].outputs;
+                if (kd_bufs[_j]) free(kd_bufs[_j]);
+                kd_bufs[_j] = (float*)xcalloc(buf_n, sizeof(float));
+                for (int _k = 0; _k < ngpus; ++_k)
+                    nets[_k].layers[sl_idx].kd_teacher_output = kd_bufs[_j];
+            }
+            net = nets[0];
+
+            // Temporary buffer: one mini-batch of RGB images for teacher
+            float *rgb_buf = (float*)xcalloc(batch * t_imgsize, sizeof(float));
+            int s_spatial  = net.w * net.h;   // student spatial (same 320x320)
+
+            for (int _i = 0; _i < n_subdiv; ++_i) {
+                // Build RGB mini-batch by duplicating grayscale channel
+                for (int _b = 0; _b < batch; ++_b) {
+                    float *gray = train.X.vals[_i * batch + _b];
+                    float *rgb  = rgb_buf + _b * t_imgsize;
+                    for (int _p = 0; _p < s_spatial; ++_p) {
+                        rgb[_p]               = gray[_p];
+                        rgb[t_spatial   + _p] = gray[_p];
+                        rgb[2*t_spatial + _p] = gray[_p];
+                    }
+                }
+
+                // Teacher forward (inference only)
+#ifdef GPU
+                cuda_push_array(teacher_net->input_state_gpu,
+                                rgb_buf, (size_t)batch * t_imgsize);
+                network_state t_state = {0};
+                t_state.index = 0;
+                t_state.net   = *teacher_net;
+                t_state.input = teacher_net->input_state_gpu;
+                t_state.train = 0;
+                t_state.delta = NULL;
+                t_state.truth = NULL;
+                forward_network_gpu(*teacher_net, t_state);
+                cudaStreamSynchronize(get_cuda_stream());
+                // YOLO GPU forward with train=0 pulls output to l.output (CPU)
+                // so we can memcpy directly
+#else
+                network_state t_state = {0};
+                t_state.index = 0;
+                t_state.net   = *teacher_net;
+                t_state.input = rgb_buf;
+                t_state.train = 0;
+                t_state.delta = NULL;
+                t_state.truth = NULL;
+                forward_network(*teacher_net, t_state);
+#endif
+                // Copy teacher YOLO outputs into per-subdivision buffers
+                for (int _j = 0; _j < kd_n_pairs; ++_j) {
+                    int tl_idx = kd_teacher_yolo_idx[_j];
+                    layer *tl  = &teacher_net->layers[tl_idx];
+                    int n      = batch * tl->outputs;
+#ifdef GPU
+                    // output already pulled to CPU inside forward_yolo_layer_gpu (train=0)
+                    cuda_pull_array(tl->output_gpu, tl->output, n);
+#endif
+                    memcpy(kd_bufs[_j] + (size_t)_i * n, tl->output,
+                           n * sizeof(float));
+                }
+            }
+            free(rgb_buf);
+        }
+        // ── End KD BLOCK B ────────────────────────────────────────────────────
+
 #ifdef GPU
         if (ngpus == 1) {
             int wait_key = (dont_show) ? 0 : 1;
@@ -447,6 +578,17 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     for (k = 0; k < ngpus; ++k) free_network(nets[k]);
     free(nets);
     //free_network(net);
+
+    // ── KD BLOCK C: cleanup teacher network and output buffers ───────────────
+    if (teacher_net) {
+        free_network(*teacher_net);
+        free(teacher_net);
+        teacher_net = NULL;
+    }
+    for (int _j = 0; _j < kd_n_pairs; ++_j) {
+        if (kd_bufs[_j]) { free(kd_bufs[_j]); kd_bufs[_j] = NULL; }
+    }
+    // ── End KD BLOCK C ────────────────────────────────────────────────────────
 
     if (calc_map) {
         net_map.n = 0;

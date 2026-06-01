@@ -692,6 +692,12 @@ struct layer {
     void* poolingDesc;
 #endif  // CUDNN
 //#endif  // GPU
+
+    // Knowledge Distillation (Response-Based, logit-level MSE)
+    // kd_teacher_output: flat buffer [n_subdivisions * batch * outputs] (CPU), NULL = disabled
+    // kd_weight: KD loss weight (0.0 = disabled)
+    float *kd_teacher_output;
+    float  kd_weight;
 };
 
 
