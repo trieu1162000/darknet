@@ -941,7 +941,7 @@ void forward_yolo_layer(const layer l, network_state state)
                 for (c = 4; c < entry_size; ++c) {
                     int base = bb * l.outputs + a * entry_size * spatial + c * spatial;
                     for (s = 0; s < spatial; ++s) {
-                        float diff = l.output[base + s] - teacher_out[base + s];
+                        float diff = teacher_out[base + s] - l.output[base + s];
                         l.delta[base + s] += l.kd_weight * 2.0f * diff;
                     }
                 }
