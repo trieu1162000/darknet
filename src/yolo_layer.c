@@ -937,12 +937,17 @@ void forward_yolo_layer(const layer l, network_state state)
         int a, bb, s, c;
         for (bb = 0; bb < l.batch; ++bb) {
             for (a = 0; a < l.n; ++a) {
-                // objectness: entry 4, then class probs: entries 5..4+classes
-                for (c = 4; c < entry_size; ++c) {
-                    int base = bb * l.outputs + a * entry_size * spatial + c * spatial;
-                    for (s = 0; s < spatial; ++s) {
+                int obj_base = bb * l.outputs + a * entry_size * spatial + 4 * spatial;
+                for (s = 0; s < spatial; ++s) {
+                    float teacher_obj = teacher_out[obj_base + s];
+                    // Confidence mask: skip if teacher is unsure
+                    // (prevents conflicting gradients from false positives)
+                    if (teacher_obj < 0.5f) continue;
+                    // objectness: entry 4, then class probs: entries 5..4+classes
+                    for (c = 4; c < entry_size; ++c) {
+                        int base = bb * l.outputs + a * entry_size * spatial + c * spatial;
                         float diff = teacher_out[base + s] - l.output[base + s];
-                        l.delta[base + s] += l.kd_weight * 2.0f * diff;
+                        l.delta[base + s] += l.kd_weight * 2.0f * diff * teacher_obj;
                     }
                 }
             }
