@@ -90,18 +90,27 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     // Add to your .data file:
     //   teacher_cfg     = mycfg/yolov4-tiny_helmet.cfg
     //   teacher_weights = mybackup/yolov4-tiny_helmet_final.weights
-    //   kd_weight       = 0.1
+    //   kd_weight       = 0.3   (response KD: obj + cls + box)
+    //   kd_feat_weight  = 0.1   (feature KD: pre-YOLO raw feature MSE)
+    //   kd_temperature  = 4.0   (temperature scaling for soft labels; 1.0 = off)
     char *teacher_cfg_file     = option_find_str_quiet(options, "teacher_cfg",     "");
     char *teacher_weights_file = option_find_str_quiet(options, "teacher_weights", "");
-    float kd_weight_val        = option_find_float_quiet(options, "kd_weight", 0.0f);
+    float kd_weight_val        = option_find_float_quiet(options, "kd_weight",      0.0f);
+    float kd_feat_weight_val   = option_find_float_quiet(options, "kd_feat_weight", 0.0f);
+    float kd_temperature_val   = option_find_float_quiet(options, "kd_temperature", 1.0f);
     network *teacher_net = NULL;
     int kd_n_pairs = 0;
     int kd_teacher_yolo_idx[8]; memset(kd_teacher_yolo_idx, -1, sizeof(kd_teacher_yolo_idx));
     int kd_student_yolo_idx[8]; memset(kd_student_yolo_idx, -1, sizeof(kd_student_yolo_idx));
     float *kd_bufs[8];          memset(kd_bufs, 0, sizeof(kd_bufs));
-    if (strlen(teacher_cfg_file) > 0 && strlen(teacher_weights_file) > 0 && kd_weight_val > 0.0f) {
-        printf("\n[KD] teacher_cfg     = %s\n[KD] teacher_weights = %s\n[KD] kd_weight       = %.3f\n",
-               teacher_cfg_file, teacher_weights_file, kd_weight_val);
+    float *kd_feat_bufs[8];     memset(kd_feat_bufs, 0, sizeof(kd_feat_bufs));
+    if (strlen(teacher_cfg_file) > 0 && strlen(teacher_weights_file) > 0 &&
+        (kd_weight_val > 0.0f || kd_feat_weight_val > 0.0f)) {
+        printf("\n[KD] teacher_cfg      = %s\n[KD] teacher_weights  = %s\n"
+               "[KD] kd_weight        = %.3f\n[KD] kd_feat_weight   = %.3f\n"
+               "[KD] kd_temperature   = %.1f\n",
+               teacher_cfg_file, teacher_weights_file,
+               kd_weight_val, kd_feat_weight_val, kd_temperature_val);
         teacher_net = (network*)xcalloc(1, sizeof(network));
         *teacher_net = parse_network_cfg_custom(teacher_cfg_file, net.batch, 0);
         load_weights(teacher_net, teacher_weights_file);
@@ -120,9 +129,12 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
                     if (sl->w == tl->w && sl->h == tl->h) {
                         kd_student_yolo_idx[kd_n_pairs] = _i;
                         kd_teacher_yolo_idx[kd_n_pairs] = t_yolo_idxs[_t];
-                        // Set kd_weight on all GPU copies of this student YOLO layer
-                        for (int _k = 0; _k < ngpus; ++_k)
-                            nets[_k].layers[_i].kd_weight = kd_weight_val;
+                        // Set KD params on all GPU copies of this student YOLO layer
+                        for (int _k = 0; _k < ngpus; ++_k) {
+                            nets[_k].layers[_i].kd_weight      = kd_weight_val;
+                            nets[_k].layers[_i].kd_feat_weight = kd_feat_weight_val;
+                            nets[_k].layers[_i].kd_temperature = kd_temperature_val;
+                        }
                         ++kd_n_pairs;
                         break;
                     }
@@ -344,6 +356,8 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
             int t_imgsize = t_spatial * teacher_net->c;        // 3-ch for teacher
 
             // (Re-)allocate flat buffers: [n_subdiv * batch * outputs] per YOLO pair
+            // kd_bufs:      teacher post-sigmoid YOLO outputs  (response KD)
+            // kd_feat_bufs: teacher pre-activation YOLO inputs (feature KD)
             for (int _j = 0; _j < kd_n_pairs; ++_j) {
                 int tl_idx = kd_teacher_yolo_idx[_j];
                 int sl_idx = kd_student_yolo_idx[_j];
@@ -352,6 +366,15 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
                 kd_bufs[_j] = (float*)xcalloc(buf_n, sizeof(float));
                 for (int _k = 0; _k < ngpus; ++_k)
                     nets[_k].layers[sl_idx].kd_teacher_output = kd_bufs[_j];
+
+                if (kd_feat_weight_val > 0.0f) {
+                    // teacher pre-YOLO layer has same output size as the YOLO layer itself
+                    // (filters=21 conv is equivalent to 3*(4+1+classes)*H*W = same as YOLO outputs)
+                    if (kd_feat_bufs[_j]) free(kd_feat_bufs[_j]);
+                    kd_feat_bufs[_j] = (float*)xcalloc(buf_n, sizeof(float));
+                    for (int _k = 0; _k < ngpus; ++_k)
+                        nets[_k].layers[sl_idx].kd_teacher_input = kd_feat_bufs[_j];
+                }
             }
             net = nets[0];
 
@@ -396,7 +419,7 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
                 t_state.truth = NULL;
                 forward_network(*teacher_net, t_state);
 #endif
-                // Copy teacher YOLO outputs into per-subdivision buffers
+                // Copy teacher buffers into per-subdivision slots
                 for (int _j = 0; _j < kd_n_pairs; ++_j) {
                     int tl_idx = kd_teacher_yolo_idx[_j];
                     layer *tl  = &teacher_net->layers[tl_idx];
@@ -405,8 +428,21 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
                     // output already pulled to CPU inside forward_yolo_layer_gpu (train=0)
                     cuda_pull_array(tl->output_gpu, tl->output, n);
 #endif
-                    memcpy(kd_bufs[_j] + (size_t)_i * n, tl->output,
-                           n * sizeof(float));
+                    // Response KD: post-sigmoid YOLO outputs
+                    memcpy(kd_bufs[_j] + (size_t)_i * n, tl->output, n * sizeof(float));
+
+                    // Feature KD: pre-activation features from layer BEFORE teacher YOLO
+                    if (kd_feat_bufs[_j] && tl_idx > 0) {
+                        layer *t_neck = &teacher_net->layers[tl_idx - 1];
+                        int fn = batch * t_neck->outputs;
+                        if (fn == n) {  // sanity: same size (both = 3*(4+1+cls)*H*W)
+#ifdef GPU
+                            cuda_pull_array(t_neck->output_gpu, t_neck->output, fn);
+#endif
+                            memcpy(kd_feat_bufs[_j] + (size_t)_i * fn,
+                                   t_neck->output, fn * sizeof(float));
+                        }
+                    }
                 }
             }
             free(rgb_buf);
@@ -586,7 +622,8 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
         teacher_net = NULL;
     }
     for (int _j = 0; _j < kd_n_pairs; ++_j) {
-        if (kd_bufs[_j]) { free(kd_bufs[_j]); kd_bufs[_j] = NULL; }
+        if (kd_bufs[_j])      { free(kd_bufs[_j]);      kd_bufs[_j]      = NULL; }
+        if (kd_feat_bufs[_j]) { free(kd_feat_bufs[_j]); kd_feat_bufs[_j] = NULL; }
     }
     // ── End KD BLOCK C ────────────────────────────────────────────────────────
 

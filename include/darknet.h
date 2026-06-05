@@ -693,11 +693,17 @@ struct layer {
 #endif  // CUDNN
 //#endif  // GPU
 
-    // Knowledge Distillation (Response-Based, logit-level MSE)
-    // kd_teacher_output: flat buffer [n_subdivisions * batch * outputs] (CPU), NULL = disabled
-    // kd_weight: KD loss weight (0.0 = disabled)
+    // Knowledge Distillation
+    // kd_teacher_output: teacher post-sigmoid outputs [n_subdiv * batch * outputs], NULL=disabled
+    // kd_teacher_input:  teacher pre-activation features [n_subdiv * batch * inputs] for feature KD
+    // kd_weight:         response KD loss weight (obj + class + box entries)
+    // kd_feat_weight:    feature KD loss weight  (pre-YOLO raw feature MSE)
+    // kd_temperature:    temperature T for soft labels (>1 = softer; 1.0 = no scaling)
     float *kd_teacher_output;
+    float *kd_teacher_input;
     float  kd_weight;
+    float  kd_feat_weight;
+    float  kd_temperature;
 };
 
 
