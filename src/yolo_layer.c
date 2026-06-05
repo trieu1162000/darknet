@@ -940,9 +940,10 @@ void forward_yolo_layer(const layer l, network_state state)
                 int obj_base = bb * l.outputs + a * entry_size * spatial + 4 * spatial;
                 for (s = 0; s < spatial; ++s) {
                     float teacher_obj = teacher_out[obj_base + s];
-                    // Confidence mask: skip if teacher is unsure
-                    // (prevents conflicting gradients from false positives)
-                    if (teacher_obj < 0.5f) continue;
+                    // Confidence mask: skip low-confidence teacher cells.
+                    // 0.25 threshold (was 0.5) — the 0.5 threshold fired on <2% of cells
+                    // (YOLO grids are sparse), effectively producing zero KD signal.
+                    if (teacher_obj < 0.25f) continue;
                     // objectness: entry 4, then class probs: entries 5..4+classes
                     for (c = 4; c < entry_size; ++c) {
                         int base = bb * l.outputs + a * entry_size * spatial + c * spatial;
