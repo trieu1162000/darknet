@@ -239,6 +239,9 @@ convolutional_layer parse_convolutional(list *options, size_params params)
     layer.stream = option_find_int_quiet(options, "stream", -1);
     layer.wait_stream_id = option_find_int_quiet(options, "wait_stream", -1);
 
+    layer.kd_stage = option_find_int_quiet(options, "kd_stage", 0);
+    layer.kd_feat_weight = option_find_float_quiet(options, "kd_feat_weight", 0.0f);
+
     if(params.net.adam){
         layer.B1 = params.net.B1;
         layer.B2 = params.net.B2;

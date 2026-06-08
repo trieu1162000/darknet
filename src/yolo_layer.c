@@ -927,65 +927,33 @@ void forward_yolo_layer(const layer l, network_state state)
     }
 
     // KD Block 
-    // teacher buffers are pre-computed per subdivision in detector.c BLOCK B
-    if ((l.kd_teacher_output || l.kd_teacher_input) &&
-        (l.kd_weight > 0.0f || l.kd_feat_weight > 0.0f))
+    // teacher outputs are pre-computed in detector.c BLOCK B
+    // This block adds MSE gradients on obj + class towards the teacher,
+    // masked by teacher confidence to avoid false-positive conflicts.
+    if (l.kd_teacher_output && l.kd_weight > 0.0f)
     {
         int spatial    = l.w * l.h;
         int entry_size = 4 + 1 + l.classes;  // tx,ty,tw,th, obj, cls...
         size_t subdiv_offset = state.net.current_subdivision * (size_t)l.batch * l.outputs;
-        float *teacher_out  = l.kd_teacher_output ? l.kd_teacher_output  + subdiv_offset : NULL;
-        float *teacher_feat = l.kd_teacher_input  ? l.kd_teacher_input   + subdiv_offset : NULL;
-        float T = (l.kd_temperature > 1.0f) ? l.kd_temperature : 1.0f;
+        float *teacher_out = l.kd_teacher_output + subdiv_offset;
         int a, bb, s, c;
 
         for (bb = 0; bb < l.batch; ++bb) {
             for (a = 0; a < l.n; ++a) {
                 int obj_base = bb * l.outputs + a * entry_size * spatial + 4 * spatial;
                 for (s = 0; s < spatial; ++s) {
-                    if (!teacher_out) break;
                     float teacher_obj = teacher_out[obj_base + s];
-                    if (teacher_obj < 0.25f) continue;
+                    // Confidence mask: only distill cells where the teacher is confident
+                    if (teacher_obj < 0.5f) continue;
 
-                    // Response KD: MSE on all entries (box + obj + cls)
-                    if (l.kd_weight > 0.0f) {
-                        for (c = 0; c < entry_size; ++c) {
-                            int base = bb * l.outputs + a * entry_size * spatial + c * spatial;
-                            float t_val = teacher_out[base + s];
-
-                            // Temperature scaling for obj/cls soft labels (entries 4+)
-                            // Softer teacher distribution → richer "dark knowledge"
-                            if (c >= 4 && T > 1.0f) {
-                                float logit = logf(t_val / (1.0f - t_val + 1e-7f) + 1e-7f);
-                                t_val = 1.0f / (1.0f + expf(-logit / T));
-                            }
-
-                            float diff = t_val - l.output[base + s];
-                            // Box entries (0-3): use 0.5x weight (different scale than cls/obj)
-                            float w = (c < 4) ? l.kd_weight * 0.5f : l.kd_weight;
-                            l.delta[base + s] += w * 2.0f * diff * teacher_obj;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Feature KD: MSE on pre-YOLO raw features
-        // state.input = student pre-activation features (same layout as l.output)
-        // teacher_feat = teacher pre-activation features (identical layout: same anchors/classes)
-        // Gradient w.r.t. state.input → added to l.delta, propagated in backward_yolo_layer
-        if (l.kd_feat_weight > 0.0f && teacher_feat && teacher_out) {
-            for (bb = 0; bb < l.batch; ++bb) {
-                for (a = 0; a < l.n; ++a) {
-                    int obj_base = bb * l.outputs + a * entry_size * spatial + 4 * spatial;
-                    for (s = 0; s < spatial; ++s) {
-                        float teacher_obj = teacher_out[obj_base + s];
-                        if (teacher_obj < 0.25f) continue;
-                        for (c = 0; c < entry_size; ++c) {
-                            int base = bb * l.outputs + a * entry_size * spatial + c * spatial;
-                            float diff = teacher_feat[base + s] - state.input[base + s];
-                            l.delta[base + s] += l.kd_feat_weight * 2.0f * diff * teacher_obj;
-                        }
+                    // KD on objectness (entry 4) + class probs (entries 5..4+classes)
+                    // Skip box entries (0-3): box regression has different scale,
+                    // and matching box params doesn't improve detection.
+                    for (c = 4; c < entry_size; ++c) {
+                        int base = bb * l.outputs + a * entry_size * spatial + c * spatial;
+                        float diff = teacher_out[base + s] - l.output[base + s];
+                        // Weight by teacher confidence: confident cells → more KD signal
+                        l.delta[base + s] += l.kd_weight * 2.0f * diff * teacher_obj;
                     }
                 }
             }

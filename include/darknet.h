@@ -704,6 +704,16 @@ struct layer {
     float  kd_weight;
     float  kd_feat_weight;
     float  kd_temperature;
+
+    // Multi-stage feature KD (conv layer fields)
+    // kd_feat_teacher_output: teacher feature buffer for feature KD [n_subdiv * batch * outputs] (CPU)
+    // kd_feat_teacher_output_gpu: teacher feature buffer on GPU
+    // kd_feat_weight:         per-layer feature KD weight (set from the global value)
+    // kd_stage:               distillation stage ID (0 = disabled, 1/2/3 = stage index)
+    float *kd_feat_teacher_output;
+    float *kd_feat_teacher_output_gpu;
+    float  kd_feat_weight;
+    int    kd_stage;
 };
 
 

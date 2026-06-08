@@ -104,6 +104,10 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     int kd_student_yolo_idx[8]; memset(kd_student_yolo_idx, -1, sizeof(kd_student_yolo_idx));
     float *kd_bufs[8];          memset(kd_bufs, 0, sizeof(kd_bufs));
     float *kd_feat_bufs[8];     memset(kd_feat_bufs, 0, sizeof(kd_feat_bufs));
+    float *kd_feat_bufs_gpu[8]; memset(kd_feat_bufs_gpu, 0, sizeof(kd_feat_bufs_gpu));
+    int kd_n_feat_stages = 0;
+    int kd_teacher_feat_layers[8]; memset(kd_teacher_feat_layers, -1, sizeof(kd_teacher_feat_layers));
+    int kd_student_feat_stages[8]; memset(kd_student_feat_stages, -1, sizeof(kd_student_feat_stages));
     if (strlen(teacher_cfg_file) > 0 && strlen(teacher_weights_file) > 0 &&
         (kd_weight_val > 0.0f || kd_feat_weight_val > 0.0f)) {
         printf("\n[KD] teacher_cfg      = %s\n[KD] teacher_weights  = %s\n"
@@ -146,6 +150,20 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
             free_network(*teacher_net); free(teacher_net); teacher_net = NULL;
         } else {
             printf("[KD] Matched %d student/teacher YOLO layer pair(s). KD enabled.\n", kd_n_pairs);
+            // Feature KD: hardcoded stage mappings (teacher_conv_layer : student_kd_stage)
+            if (kd_feat_weight_val > 0.0f) {
+                int stage_pairs[][2] = {{2, 1}, {10, 2}, {26, 3}};
+                kd_n_feat_stages = 3;
+                for (int _s = 0; _s < kd_n_feat_stages; ++_s) {
+                    kd_teacher_feat_layers[_s] = stage_pairs[_s][0];
+                    kd_student_feat_stages[_s] = stage_pairs[_s][1];
+                    layer *tl = &teacher_net->layers[stage_pairs[_s][0]];
+                    printf("[KD] Feature stage %d: teacher layer %d (stage %d, %d x %d x %d) -> student kd_stage=%d\n",
+                           _s, stage_pairs[_s][0], stage_pairs[_s][1],
+                           tl->w, tl->h, tl->c,
+                           kd_student_feat_stages[_s]);
+                }
+            }
         }
     }
     net = nets[0];
@@ -366,14 +384,18 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
                 kd_bufs[_j] = (float*)xcalloc(buf_n, sizeof(float));
                 for (int _k = 0; _k < ngpus; ++_k)
                     nets[_k].layers[sl_idx].kd_teacher_output = kd_bufs[_j];
+            }
 
-                if (kd_feat_weight_val > 0.0f) {
-                    // teacher pre-YOLO layer has same output size as the YOLO layer itself
-                    // (filters=21 conv is equivalent to 3*(4+1+classes)*H*W = same as YOLO outputs)
-                    if (kd_feat_bufs[_j]) free(kd_feat_bufs[_j]);
-                    kd_feat_bufs[_j] = (float*)xcalloc(buf_n, sizeof(float));
-                    for (int _k = 0; _k < ngpus; ++_k)
-                        nets[_k].layers[sl_idx].kd_teacher_input = kd_feat_bufs[_j];
+            // Allocate feature KD buffers for multi-stage feature distillation
+            if (kd_feat_weight_val > 0.0f && kd_n_feat_stages > 0) {
+                for (int _s = 0; _s < kd_n_feat_stages; ++_s) {
+                    int tl_idx = kd_teacher_feat_layers[_s];
+                    layer *tl = &teacher_net->layers[tl_idx];
+                    int feat_n = n_subdiv * batch * tl->outputs;
+                    if (kd_feat_bufs[_s]) free(kd_feat_bufs[_s]);
+                    kd_feat_bufs[_s] = (float*)xcalloc(feat_n, sizeof(float));
+                    printf("[KD] Feature stage %d buffer: teacher layer %d outputs=%d total=%.1fM\n",
+                           _s, tl_idx, tl->outputs, feat_n * sizeof(float) / 1e6);
                 }
             }
             net = nets[0];
@@ -431,21 +453,58 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
                     // Response KD: post-sigmoid YOLO outputs
                     memcpy(kd_bufs[_j] + (size_t)_i * n, tl->output, n * sizeof(float));
 
-                    // Feature KD: pre-activation features from layer BEFORE teacher YOLO
-                    if (kd_feat_bufs[_j] && tl_idx > 0) {
-                        layer *t_neck = &teacher_net->layers[tl_idx - 1];
-                        int fn = batch * t_neck->outputs;
-                        if (fn == n) {  // sanity: same size (both = 3*(4+1+cls)*H*W)
+                    // Multi-stage feature KD: copy teacher conv features
+                    for (int _s = 0; _s < kd_n_feat_stages; ++_s) {
+                        int tl_idx = kd_teacher_feat_layers[_s];
+                        layer *tl_f = &teacher_net->layers[tl_idx];
+                        int fn = batch * tl_f->outputs;
 #ifdef GPU
-                            cuda_pull_array(t_neck->output_gpu, t_neck->output, fn);
+                        cuda_pull_array(tl_f->output_gpu, tl_f->output, fn);
 #endif
-                            memcpy(kd_feat_bufs[_j] + (size_t)_i * fn,
-                                   t_neck->output, fn * sizeof(float));
-                        }
+                        memcpy(kd_feat_bufs[_s] + (size_t)_i * fn,
+                               tl_f->output, fn * sizeof(float));
                     }
                 }
             }
             free(rgb_buf);
+
+#ifdef GPU
+            // Push teacher feature buffers to GPU for feature KD
+            if (kd_feat_weight_val > 0.0f && kd_n_feat_stages > 0) {
+                for (int _s = 0; _s < kd_n_feat_stages; ++_s) {
+                    int tl_idx = kd_teacher_feat_layers[_s];
+                    layer *tl = &teacher_net->layers[tl_idx];
+                    int feat_n = n_subdiv * batch * tl->outputs;
+                    if (kd_feat_bufs_gpu[_s]) cuda_free(kd_feat_bufs_gpu[_s]);
+                    kd_feat_bufs_gpu[_s] = cuda_make_array(kd_feat_bufs[_s], feat_n);
+                }
+            }
+#endif
+
+            // Set teacher feature buffer pointers on student projection conv layers
+            if (kd_feat_weight_val > 0.0f && kd_n_feat_stages > 0) {
+                for (int _s = 0; _s < kd_n_feat_stages; ++_s) {
+                    int s_stage = kd_student_feat_stages[_s];
+                    for (int _l = 0; _l < net.n; ++_l) {
+                        if (net.layers[_l].kd_stage == s_stage) {
+                            for (int _k = 0; _k < ngpus; ++_k) {
+                                nets[_k].layers[_l].kd_feat_teacher_output = kd_feat_bufs[_s];
+                                nets[_k].layers[_l].kd_feat_teacher_output_gpu = kd_feat_bufs_gpu[_s];
+                                nets[_k].layers[_l].kd_feat_weight = kd_feat_weight_val;
+                            }
+                            printf("[KD] Feature stage %d: student layer %d (kd_stage=%d) "
+                                   "w=%d h=%d c=%d <- teacher layer %d w=%d h=%d c=%d\n",
+                                   _s, _l, s_stage,
+                                   net.layers[_l].w, net.layers[_l].h, net.layers[_l].c,
+                                   kd_teacher_feat_layers[_s],
+                                   teacher_net->layers[kd_teacher_feat_layers[_s]].w,
+                                   teacher_net->layers[kd_teacher_feat_layers[_s]].h,
+                                   teacher_net->layers[kd_teacher_feat_layers[_s]].c);
+                            break;
+                        }
+                    }
+                }
+            }
         }
         // ── End KD BLOCK B ────────────────────────────────────────────────────
 
@@ -623,8 +682,16 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     }
     for (int _j = 0; _j < kd_n_pairs; ++_j) {
         if (kd_bufs[_j])      { free(kd_bufs[_j]);      kd_bufs[_j]      = NULL; }
+    }
+    int max_feat_buf = (kd_n_feat_stages > kd_n_pairs) ? kd_n_feat_stages : kd_n_pairs;
+    for (int _j = 0; _j < max_feat_buf; ++_j) {
         if (kd_feat_bufs[_j]) { free(kd_feat_bufs[_j]); kd_feat_bufs[_j] = NULL; }
     }
+#ifdef GPU
+    for (int _s = 0; _s < kd_n_feat_stages; ++_s) {
+        if (kd_feat_bufs_gpu[_s]) { cuda_free(kd_feat_bufs_gpu[_s]); kd_feat_bufs_gpu[_s] = NULL; }
+    }
+#endif
     // ── End KD BLOCK C ────────────────────────────────────────────────────────
 
     if (calc_map) {

@@ -1403,6 +1403,17 @@ void forward_convolutional_layer(convolutional_layer l, network_state state)
     else if (l.activation == NORM_CHAN_SOFTMAX_MAXVAL) activate_array_normalize_channels_softmax(l.output, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output, 1);
     else activate_array_cpu_custom(l.output, l.outputs*l.batch, l.activation);
 
+    // Feature Knowledge Distillation: compute MSE gradient if teacher features available
+    if (l.kd_feat_teacher_output && l.kd_feat_weight > 0.0f && state.train) {
+        int count = l.outputs * l.batch;
+        float *teacher_feat = l.kd_feat_teacher_output + state.net.current_subdivision * count;
+        int i;
+        for (i = 0; i < count; ++i) {
+            float diff = teacher_feat[i] - l.output[i];
+            l.delta[i] += l.kd_feat_weight * 2.0f * diff;
+        }
+    }
+
     if(l.binary || l.xnor) swap_binary(&l);
 
     //visualize_convolutional_layer(l, "conv_visual", NULL);
