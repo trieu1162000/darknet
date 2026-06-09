@@ -623,6 +623,7 @@ void forward_convolutional_layer_gpu(convolutional_layer l, network_state state)
         float scale = l.kd_feat_weight * 2.0f;
         axpy_ongpu(count, scale, teacher_feat_gpu, 1, l.delta_gpu, 1);
         axpy_ongpu(count, -scale, l.output_gpu, 1, l.delta_gpu, 1);
+        CHECK_CUDA(cudaDeviceSynchronize());
     }
     //if(l.dot > 0) dot_error_gpu(l);
     if(l.binary || l.xnor) swap_binary(&l);

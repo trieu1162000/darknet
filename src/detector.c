@@ -418,6 +418,7 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
 
                 // Teacher forward (inference only)
 #ifdef GPU
+                cuda_set_device(teacher_net->gpu_index);
                 cuda_push_array(teacher_net->input_state_gpu,
                                 rgb_buf, (size_t)batch * t_imgsize);
                 network_state t_state = {0};
@@ -471,6 +472,7 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
 #ifdef GPU
             // Push teacher feature buffers to GPU for feature KD
             if (kd_feat_weight_val > 0.0f && kd_n_feat_stages > 0) {
+                cuda_set_device(net.gpu_index);
                 for (int _s = 0; _s < kd_n_feat_stages; ++_s) {
                     int tl_idx = kd_teacher_feat_layers[_s];
                     layer *tl = &teacher_net->layers[tl_idx];
